@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+snipsy-core = { path = "crates/core" }
+snipsy-media = { path = "crates/media" }
+snipsy-audio = { path = "crates/audio" }
+snipsy-render = { path = "crates/render" }
+snipsy-export = { path = "crates/export" }
+snipsy-subtitles = { path = "crates/subtitles" }
+anyhow = "1"
+log = "0.4"
+crossbeam-channel = "0.5"
+ffmpeg-next = "9"
+cpal = "0.18"
+eframe = "0.37"
+egui = "0.37"
+rfd = "0.17"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

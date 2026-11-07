@@ -1,0 +1,12 @@
+[package]
+name = "snipsy-media"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+snipsy-audio.workspace = true
+snipsy-core.workspace = true
+anyhow.workspace = true
+log.workspace = true
+crossbeam-channel.workspace = true
+ffmpeg-next.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "snipsy-audio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+cpal.workspace = true

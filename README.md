@@ -1,0 +1,116 @@
+# Snipsy
+
+Editor de video no lineal escrito en Rust (egui + FFmpeg + wgpu).
+
+## Requisitos (macOS)
+
+```sh
+brew install ffmpeg pkg-config cmake   # cmake: para compilar whisper.cpp
+rustup update stable   # egui 0.37 requiere Rust ≥ 1.95
+```
+
+## Ejecutar
+
+```sh
+cargo run --release                    # abre la app
+cargo run --release -- /ruta/video.mp4 # abre un video directamente
+cargo test                             # pruebas (genera clips con ffmpeg)
+cargo test --release -p snipsy-export -- --ignored --nocapture  # medir velocidad de exportación
+cargo test --release -p snipsy-subtitles -- --ignored --nocapture  # transcripción real (descarga el modelo base)
+```
+
+## Atajos
+
+| Tecla | Acción |
+|---|---|
+| Espacio / K | Reproducir / pausa |
+| → / ← | Cuadro siguiente / anterior |
+| Home / End | Inicio / final |
+| A / B | Herramienta selección / cuchilla |
+| T | Agregar texto en el cabezal |
+| ⌘B | Cortar en el cabezal (clips seleccionados o todos) |
+| Supr / ⌫ | Borrar selección (⇧ = borrado ripple, cierra el hueco) |
+| N | Imán (snapping) |
+| = / - / ⇧Z | Acercar / alejar / ajustar timeline |
+| ⌘Z / ⇧⌘Z | Deshacer / rehacer |
+| ⌘I / ⌘O / ⌘S | Importar / abrir proyecto / guardar |
+| ⌘E | Exportar a MP4 |
+
+En el timeline: arrastra un clip para moverlo (también entre pistas), arrastra sus
+bordes para recortarlo, rueda/trackpad para desplazarte y pellizco o ⌘+rueda para zoom.
+Los clips de video y su audio quedan vinculados y se editan juntos.
+
+En el visor: haz clic en una capa para seleccionarla, arrástrala para moverla (se
+imanta al centro) y arrastra sus esquinas para escalarla. El inspector (derecha)
+ajusta posición, escala, rotación, opacidad y el estilo de los textos. Sin selección
+muestra el formato del proyecto (16:9, 9:16, 1:1, 4:5…). «Rellenar» hace que un video
+horizontal cubra un lienzo vertical.
+
+Efectos (inspector, con un clip seleccionado):
+
+- **Keyframes**: el rombo ◇ junto a cada propiedad crea un keyframe en el cuadro actual
+  (◆ = hay uno aquí; clic para quitarlo, clic derecho para elegir la curva: suave,
+  lineal o mantener). Con la propiedad animada, mover o escalar en el visor también
+  crea/ajusta keyframes. Los rombos amarillos del timeline marcan los keyframes.
+- **Animación rápida**: zoom lento (Ken Burns), entrar desde abajo y «pop».
+- **Fundidos** de entrada/salida (a negro en video, a silencio en audio) y
+  **disolvencia** con el clip anterior pegado en la misma pista (también funde el audio).
+  Usa el material sobrante de ambos clips; si no hay, se acorta.
+- **Color**: exposición, contraste, saturación, temperatura, tinte y LUT `.cube` con intensidad.
+- **Audio**: volumen en dB (animable con keyframes), fundidos y fundido cruzado.
+- **Velocidad**: 0,25× a 4× (cámara lenta / rápida). El clip cambia de duración, los
+  siguientes se desplazan y el audio conserva el tono (filtro `atempo` de FFmpeg).
+
+Subtítulos automáticos (**💬 Subtítulos**): transcribe el audio del timeline con Whisper
+(whisper.cpp con Metal, todo local) y crea textos sincronizados por palabra en la pista
+«Subtítulos». Estilo *Reel* (2–3 palabras grandes en mayúsculas) o *Clásico* (frases en
+dos líneas). El modelo se descarga la primera vez en
+`~/Library/Application Support/Snipsy/models`. Cada subtítulo es un texto editable;
+«Aplicar estilo a todos los subtítulos» copia el formato de uno a toda la pista, y
+«Guardar .srt…» exporta el archivo de subtítulos. Animaciones: resaltar la palabra que
+se dice (color a elección), aparecer palabra a palabra y entrada con rebote; también
+se pueden activar en cualquier texto desde el inspector («Animación de palabras»).
+
+Marca (**🎨 Marca**): kits con el logo, los colores (principal, secundario, acento,
+texto) y la tipografía de la empresa, guardados en
+`~/Library/Application Support/Snipsy/brands` (con copia del logo y de la fuente).
+Con un clic: **Poner logo** (pista «Logo», arriba de todo, en la esquina, tamaño y
+opacidad elegidos), **Aplicar a todos los textos** (fuente y colores) e **Insertar**
+textos prediseñados en el cabezal: título, rótulo con nombre y cargo, y llamada a la
+acción con rebote. Opcionalmente, los subtítulos automáticos salen con la marca.
+La fuente de cualquier texto se elige en el inspector (instaladas o archivo .ttf/.otf).
+También se pueden importar imágenes (PNG, JPG, WebP) como clips, sin límite de duración.
+
+Proxies (**⚡ Proxies**): al importar videos de más de Full HD (4K, 1440p) se crea en
+segundo plano una copia 720p con keyframes cada medio segundo, en
+`~/Library/Application Support/Snipsy/proxies`. La vista previa la usa en cuanto está
+lista (saltar en el timeline pasa de ~250 ms a ~10 ms por salto); el audio y la
+exportación usan siempre el original. El media pool muestra el estado de cada proxy
+(«Crear proxy» para hacerlo a mano con videos de 720p a 1080p). Si el archivo original
+cambia, se vuelve a crear.
+
+## Estructura
+
+```
+crates/
+├── core/   # modelo: timeline (en cuadros), ediciones, deshacer, proyecto .snipsy
+├── media/  # FFmpeg: lectores con seek preciso, motores de reproducción, mezclador, escritor MP4
+├── audio/  # salida cpal + cola de muestras; el reloj de audio es el reloj maestro
+├── render/ # compositor GPU (wgpu), escena compartida visor/exportación, texto (cosmic-text)
+├── export/ # exportación MP4 en segundo plano (GPU sin ventana + mezcla + codificación)
+├── subtitles/ # Whisper (whisper.cpp + Metal): transcripción, agrupado en subtítulos, SRT
+└── app/    # interfaz egui: media pool, visor, inspector, timeline y reproductor
+```
+
+## Hoja de ruta
+
+1. ✅ Visor: abrir, reproducir con audio sincronizado, cuadro a cuadro, scrubbing
+2. ✅ Línea de tiempo: pistas, cortar/recortar/mover, zoom, deshacer, proyectos
+3. ✅ Composición en GPU (wgpu): capas, transformaciones, texto, formatos 9:16 / 1:1 / 16:9
+4. ✅ Exportación MP4 (H.264/HEVC con VideoToolbox, AAC, BT.709, faststart)
+5. ✅ Efectos y color: keyframes, fundidos, disolvencias, corrección de color, LUTs, volumen
+6. ✅ Velocidad de clips (cámara lenta/rápida con tono de audio preservado)
+7. ✅ Subtítulos automáticos (Whisper local, estilo reel o clásico, exportación SRT)
+8. ✅ Subtítulos animados (palabra resaltada, palabra a palabra, rebote)
+9. ✅ Kits de marca (logo, colores, tipografías, textos prediseñados), imágenes fijas
+10. ✅ Proxies para editar 4K con fluidez

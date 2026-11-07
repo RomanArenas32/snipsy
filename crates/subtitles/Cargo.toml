@@ -1,0 +1,17 @@
+[package]
+name = "snipsy-subtitles"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+snipsy-core.workspace = true
+snipsy-media.workspace = true
+anyhow.workspace = true
+log.workspace = true
+crossbeam-channel.workspace = true
+whisper-rs = { version = "0.16", features = ["metal", "log_backend"] }
+ureq = "3"
+
+[dev-dependencies]
+env_logger.workspace = true
+snipsy-export.workspace = true

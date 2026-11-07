@@ -1,0 +1,12 @@
+[package]
+name = "snipsy-export"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+snipsy-core.workspace = true
+snipsy-media.workspace = true
+snipsy-render.workspace = true
+anyhow.workspace = true
+log.workspace = true
+crossbeam-channel.workspace = true
