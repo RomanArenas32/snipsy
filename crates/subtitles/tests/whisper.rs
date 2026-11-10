@@ -56,6 +56,7 @@ fn transcribes_spanish_voice_into_timeline() {
         has_video: true,
         has_audio: true,
         still: false,
+        faces: None,
     });
     tl.width = 1080;
     tl.height = 1920;

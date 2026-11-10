@@ -14,6 +14,7 @@ snipsy-audio = { path = "crates/audio" }
 snipsy-render = { path = "crates/render" }
 snipsy-export = { path = "crates/export" }
 snipsy-subtitles = { path = "crates/subtitles" }
+snipsy-faces = { path = "crates/faces" }
 anyhow = "1"
 log = "0.4"
 crossbeam-channel = "0.5"

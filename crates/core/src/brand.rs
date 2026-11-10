@@ -384,6 +384,7 @@ mod tests {
             has_video: true,
             has_audio: false,
             still: true,
+            faces: None,
         })
     }
 

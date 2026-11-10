@@ -2,8 +2,10 @@
 
 mod app;
 mod brand_ui;
+mod faces_ui;
 mod fonts_ui;
 mod inspector;
+mod library_ui;
 mod player;
 mod proxies_ui;
 mod subtitles_ui;

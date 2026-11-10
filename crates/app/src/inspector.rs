@@ -50,9 +50,19 @@ pub struct InspectorOutput {
     /// hay que reconstruir los segmentos del reproductor.
     pub rebuild: bool,
     pub seek: Option<Frame>,
+    /// Mensaje para la barra de estado.
+    pub message: Option<String>,
 }
 
-pub fn show(ui: &mut Ui, tl: &mut Timeline, history: &mut History, selection: &HashSet<ClipId>, playhead: Frame) -> InspectorOutput {
+pub fn show(
+    ui: &mut Ui,
+    tl: &mut Timeline,
+    history: &mut History,
+    selection: &HashSet<ClipId>,
+    playhead: Frame,
+    faces: &crate::faces_ui::Faces,
+    follow_faces: bool,
+) -> InspectorOutput {
     let mut undo = Undo { before: Some(tl.clone()), history, changed: false };
     let mut out = InspectorOutput::default();
     ui.add_space(4.0);
@@ -67,8 +77,8 @@ pub fn show(ui: &mut Ui, tl: &mut Timeline, history: &mut History, selection: &H
         .copied();
 
     egui::ScrollArea::vertical().show(ui, |ui| match target {
-        Some(id) => clip_ui(ui, tl, id, playhead, &mut undo, &mut out),
-        None => project_ui(ui, tl, &mut undo),
+        Some(id) => clip_ui(ui, tl, id, playhead, faces, &mut undo, &mut out),
+        None => project_ui(ui, tl, follow_faces, &mut undo),
     });
     out.changed = undo.changed;
     out
@@ -84,7 +94,7 @@ fn hint(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).small().color(Color32::GRAY));
 }
 
-fn project_ui(ui: &mut Ui, tl: &mut Timeline, undo: &mut Undo) {
+fn project_ui(ui: &mut Ui, tl: &mut Timeline, follow_faces: bool, undo: &mut Undo) {
     ui.label(RichText::new("Proyecto").heading());
     section(ui, "Formato");
     let current = FORMATS.iter().find(|(_, w, h)| *w == tl.width && *h == tl.height).map(|f| f.0);
@@ -93,8 +103,8 @@ fn project_ui(ui: &mut Ui, tl: &mut Timeline, undo: &mut Undo) {
         for (name, w, h) in FORMATS {
             let r = ui.selectable_label(current == Some(*name), *name);
             if undo.clicked(&r) {
-                tl.width = *w;
-                tl.height = *h;
+                // Reencuadrar el contenido para el formato nuevo (⌘Z vuelve atrás).
+                *tl = snipsy_core::reframe::reframe(tl, *w, *h, follow_faces);
             }
         }
     });
@@ -119,7 +129,7 @@ fn project_ui(ui: &mut Ui, tl: &mut Timeline, undo: &mut Undo) {
     );
 }
 
-fn clip_ui(ui: &mut Ui, tl: &mut Timeline, id: ClipId, playhead: Frame, undo: &mut Undo, out: &mut InspectorOutput) {
+fn clip_ui(ui: &mut Ui, tl: &mut Timeline, id: ClipId, playhead: Frame, faces: &crate::faces_ui::Faces, undo: &mut Undo, out: &mut InspectorOutput) {
     let Some((track, clip)) = tl.find(id) else { return };
     let source = tl.asset(clip.asset).map(|a| (a.width as f32, a.height as f32, a.name.clone()));
     let title = match (&clip.text, &source) {
@@ -136,7 +146,7 @@ fn clip_ui(ui: &mut Ui, tl: &mut Timeline, id: ClipId, playhead: Frame, undo: &m
     }
 
     if track.kind == TrackKind::Video {
-        video_ui(ui, tl, id, track, playhead, undo, out);
+        video_ui(ui, tl, id, track, playhead, faces, undo, out);
     }
 
     // Audio: el propio clip, o el audio vinculado al video seleccionado.
@@ -182,7 +192,17 @@ fn speed_ui(ui: &mut Ui, tl: &mut Timeline, id: ClipId, speed: f64, undo: &mut U
 
 // ---------------------------------------------------------------- video
 
-fn video_ui(ui: &mut Ui, tl: &mut Timeline, id: ClipId, track: TrackRef, playhead: Frame, undo: &mut Undo, out: &mut InspectorOutput) {
+#[allow(clippy::too_many_arguments)]
+fn video_ui(
+    ui: &mut Ui,
+    tl: &mut Timeline,
+    id: ClipId,
+    track: TrackRef,
+    playhead: Frame,
+    faces: &crate::faces_ui::Faces,
+    undo: &mut Undo,
+    out: &mut InspectorOutput,
+) {
     let project = (tl.width as f32, tl.height as f32);
     let fps = tl.fps;
     let source = tl.asset(tl.find(id).unwrap().1.asset).map(|a| (a.width as f32, a.height as f32));
@@ -192,6 +212,11 @@ fn video_ui(ui: &mut Ui, tl: &mut Timeline, id: ClipId, track: TrackRef, playhea
     let links = tl.with_links([id]);
     let is_subtitle = tl.track(track).name == snipsy_subtitles::TRACK_NAME;
     let mut apply_to_all = None;
+    // Seguimiento de rostro: solo videos (no textos ni imágenes fijas).
+    let face_asset = tl
+        .asset(tl.find(id).unwrap().1.asset)
+        .filter(|a| a.has_video && !a.still)
+        .map(|a| (a.path.clone(), a.faces.as_ref().map(|f| f.path.is_empty())));
 
     let Some(clip) = tl.clip_mut(id) else { return };
     if let Some(style) = clip.text.as_mut() {
@@ -295,6 +320,31 @@ fn video_ui(ui: &mut Ui, tl: &mut Timeline, id: ClipId, track: TrackRef, playhea
             clip.transform = Transform::default();
         }
     });
+
+    if let Some((path, analyzed)) = &face_asset {
+        let r = ui
+            .checkbox(&mut clip.follow_face, "🎯 Seguir rostro")
+            .on_hover_text("Mueve el recorte para mantener a la persona en cuadro (ideal al pasar un video horizontal a vertical)");
+        if undo.clicked(&r) {}
+        if clip.follow_face {
+            let spare = source.map(|src| {
+                let base = compose::contain(src, project);
+                let s = clip.prop_at(Prop::Scale, playhead);
+                base.0 * s > project.0 + 1.0 || base.1 * s > project.1 + 1.0
+            });
+            if let Some(f) = faces.progress(path) {
+                ui.add(egui::ProgressBar::new(f).text("Buscando rostros…").desired_width(200.0));
+            } else if let Some(e) = faces.failed(path) {
+                hint(ui, &format!("No se pudo analizar el video: {e}"));
+            } else if *analyzed == Some(true) {
+                hint(ui, "No se encontraron rostros en este video: se mantiene la posición.");
+            } else if spare == Some(false) {
+                hint(ui, "Solo tiene efecto si el video está recortado: usa «Rellenar» o un formato distinto al del video.");
+            } else {
+                hint(ui, "La posición la decide el seguimiento; desactívalo para moverlo a mano.");
+            }
+        }
+    }
 
     // --- animaciones rápidas
     section(ui, "Animación rápida");
@@ -658,13 +708,64 @@ fn audio_ui(ui: &mut Ui, tl: &mut Timeline, id: ClipId, standalone: bool, playhe
             clip.volume_db = 0.0;
         }
     });
-    if standalone {
-        hint(ui, "Consejo: para bajar la música bajo una voz, crea keyframes de volumen ◆ en distintos puntos.");
-    }
     // Todo cambio de audio requiere volver a preparar el mezclador.
     if *clip != before {
         out.rebuild = true;
     }
+    if standalone {
+        ducking_ui(ui, tl, track, undo, out);
+    }
+}
+
+fn ducking_ui(ui: &mut Ui, tl: &mut Timeline, track: TrackRef, undo: &mut Undo, out: &mut InspectorOutput) {
+    use snipsy_core::{ducking, DuckSettings};
+    section(ui, "Ducking: bajar esta pista cuando hablan");
+    let id = ui.make_persistent_id("duck_settings");
+    let mut s: DuckSettings = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+    egui::Grid::new("duck").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+        ui.label("Bajar");
+        ui.add(egui::Slider::new(&mut s.amount_db, 3.0..=30.0).suffix(" dB").fixed_decimals(0));
+        ui.end_row();
+        ui.label("Sensibilidad");
+        // Más sensibilidad = umbral más bajo (detecta voces más suaves).
+        let mut sens = -s.threshold_db;
+        ui.add(egui::Slider::new(&mut sens, 25.0..=60.0).show_value(false))
+            .on_hover_text("Súbela si no detecta una voz suave; bájala si la música baja con ruidos de fondo");
+        s.threshold_db = -sens;
+        ui.end_row();
+        ui.label("Volver a subir");
+        ui.add(egui::Slider::new(&mut s.release, 0.2..=2.0).suffix(" s").fixed_decimals(1));
+        ui.end_row();
+    });
+    ui.data_mut(|d| d.insert_temp(id, s));
+    ui.horizontal(|ui| {
+        let r = ui.button("🎙 Aplicar ducking").on_hover_text(
+            "Analiza las otras pistas de audio (voz, entrevistas) y baja esta pista mientras se habla, con keyframes de volumen que puedes retocar",
+        );
+        if undo.clicked(&r) {
+            let levels = snipsy_media::loudness::levels_without(tl, track);
+            let regions = ducking::voice_regions(&levels, tl.fps, &s);
+            let n = ducking::apply_ducking(tl, track, &regions, &s);
+            out.rebuild = true;
+            let secs: f64 = regions.iter().map(|(a, b)| tl.frame_to_secs(b - a)).sum();
+            out.message = Some(if regions.is_empty() {
+                "No se detectó voz en las otras pistas (prueba con más sensibilidad).".into()
+            } else {
+                format!("🎙 Ducking aplicado: {} tramo(s) con voz ({secs:.1} s) en {n} clip(s). Si cambias la voz, vuelve a aplicarlo.", regions.len())
+            });
+        }
+        let has_keys = tl.track(track).clips.iter().any(|c| !c.anim.volume.keys.is_empty());
+        if has_keys {
+            let r = ui.button("Quitar");
+            if undo.clicked(&r) {
+                for c in &mut tl.track_mut(track).clips {
+                    c.anim.volume.keys.clear();
+                }
+                out.rebuild = true;
+            }
+        }
+    });
+    hint(ui, "Pon la música en su propia pista de audio. Se aplica a todos los clips de esa pista.");
 }
 
 fn color_row(ui: &mut Ui, label: &str, color: &mut [u8; 4], undo: &mut Undo) {

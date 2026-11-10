@@ -10,6 +10,7 @@ snipsy-audio.workspace = true
 snipsy-render.workspace = true
 snipsy-export.workspace = true
 snipsy-subtitles.workspace = true
+snipsy-faces.workspace = true
 egui-wgpu = "0.37"
 anyhow.workspace = true
 log.workspace = true

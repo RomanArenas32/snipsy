@@ -204,6 +204,7 @@ fn draws_still_image_logo() {
         has_video: true,
         has_audio: false,
         still: true,
+        faces: None,
     });
     // Logo de 40 px de ancho (20 %) a 10 px (5 %) de la esquina superior izquierda.
     let kit = BrandKit { logo_corner: Corner::TopLeft, logo_size: 0.2, margin: 0.05, ..Default::default() };

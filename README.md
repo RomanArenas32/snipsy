@@ -58,6 +58,9 @@ Efectos (inspector, con un clip seleccionado):
   Usa el material sobrante de ambos clips; si no hay, se acorta.
 - **Color**: exposición, contraste, saturación, temperatura, tinte y LUT `.cube` con intensidad.
 - **Audio**: volumen en dB (animable con keyframes), fundidos y fundido cruzado.
+- **Ducking** (clip de música en su propia pista de audio): «Aplicar ducking» analiza
+  las otras pistas, detecta cuándo se habla y baja la música (12 dB por defecto) con
+  keyframes de volumen editables; sube sola en las pausas de más de medio segundo.
 - **Velocidad**: 0,25× a 4× (cámara lenta / rápida). El clip cambia de duración, los
   siguientes se desplazan y el audio conserva el tono (filtro `atempo` de FFmpeg).
 
@@ -81,6 +84,31 @@ acción con rebote. Opcionalmente, los subtítulos automáticos salen con la mar
 La fuente de cualquier texto se elige en el inspector (instaladas o archivo .ttf/.otf).
 También se pueden importar imágenes (PNG, JPG, WebP) como clips, sin límite de duración.
 
+Biblioteca (**📚 Biblioteca**, panel izquierdo): tu material de siempre, disponible en
+todos los proyectos, en `~/Library/Application Support/Snipsy/library`. Categorías:
+música, efectos de sonido, videos, imágenes, **Mis ediciones** (proyectos guardados,
+que se abren o se usan como plantilla) y **Exportados** (cada video exportado se agrega
+solo). «Agregar…» o «Carpeta…» copian los archivos (y detectan la categoría: un audio
+de menos de 15 s es un efecto). Búsqueda por nombre o etiqueta (sin importar tildes),
+favoritos ★, escucha previa ▶, miniaturas, «➕ Al cabezal» (la música va a la pista
+«Música», los efectos a una pista de audio libre y videos/imágenes encima del video
+principal) o arrastrar al timeline.
+
+Formatos: al cambiar el formato del proyecto (16:9, 9:16, 1:1, 4:5, 4K) el contenido
+se **reencuadra** solo: los videos a pantalla completa la siguen llenando (con el mismo
+zoom relativo), y textos y logo conservan su tamaño respecto al lado corto y su
+distancia al borde más cercano (⌘Z vuelve atrás). En **📤 Exportar** se pueden marcar
+varios formatos: se exportan uno tras otro como `Nombre_9x16.mp4`, `Nombre_1x1.mp4`…
+
+Seguimiento de rostros (🎯): cuando un video queda recortado (p. ej. 16:9 en 9:16), el
+recorte sigue a la persona en vez de quedarse al centro. Se activa o desactiva por clip
+(inspector, «Seguir rostro») y de forma general para el reencuadre (en el selector de
+formato y en el diálogo de exportación). Usa Vision de Apple (en el Mac, sin internet):
+analiza 5 cuadros por segundo en segundo plano (con el proxy si existe), elige el rostro
+principal (sin saltar entre personas), suaviza el movimiento y nunca deja ver los
+bordes del video. La trayectoria se guarda en el proyecto. La prueba de punta a punta
+necesita una foto con un rostro: `SNIPSY_FACE_IMAGE=foto.jpg cargo test -p snipsy-faces --release`.
+
 Proxies (**⚡ Proxies**): al importar videos de más de Full HD (4K, 1440p) se crea en
 segundo plano una copia 720p con keyframes cada medio segundo, en
 `~/Library/Application Support/Snipsy/proxies`. La vista previa la usa en cuanto está
@@ -98,6 +126,7 @@ crates/
 ├── audio/  # salida cpal + cola de muestras; el reloj de audio es el reloj maestro
 ├── render/ # compositor GPU (wgpu), escena compartida visor/exportación, texto (cosmic-text)
 ├── export/ # exportación MP4 en segundo plano (GPU sin ventana + mezcla + codificación)
+├── faces/  # rostros con Vision (macOS) y trayectoria suavizada para el reencuadre
 ├── subtitles/ # Whisper (whisper.cpp + Metal): transcripción, agrupado en subtítulos, SRT
 └── app/    # interfaz egui: media pool, visor, inspector, timeline y reproductor
 ```
@@ -114,3 +143,7 @@ crates/
 8. ✅ Subtítulos animados (palabra resaltada, palabra a palabra, rebote)
 9. ✅ Kits de marca (logo, colores, tipografías, textos prediseñados), imágenes fijas
 10. ✅ Proxies para editar 4K con fluidez
+11. ✅ Ducking automático de la música bajo la voz
+12. ✅ Reencuadre automático y exportación en varios formatos a la vez
+13. ✅ Biblioteca personal (música, efectos, videos, imágenes, ediciones y exportados)
+14. ✅ Seguimiento de rostros al reencuadrar (activable por clip y en general)

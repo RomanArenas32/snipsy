@@ -6,6 +6,7 @@
 
 mod audio_engine;
 mod audio_reader;
+pub mod loudness;
 mod probe;
 pub mod proxy;
 pub mod segments;

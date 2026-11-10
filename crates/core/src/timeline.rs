@@ -39,6 +39,9 @@ pub struct Asset {
     /// Imagen fija (PNG, JPG…): se puede alargar sin límite en el timeline.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub still: bool,
+    /// Trayectoria del rostro principal (se calcula al activar «Seguir rostro»).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faces: Option<crate::follow::FaceTrack>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -100,6 +103,9 @@ pub struct Clip {
     /// `len` está en cuadros del timeline; el clip consume `len × speed` cuadros de la fuente.
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub speed: f64,
+    /// Desplazar el recorte para seguir el rostro principal (videos más grandes que el lienzo).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub follow_face: bool,
 }
 
 fn one() -> f64 {
@@ -131,6 +137,7 @@ impl Clip {
             volume_db: 0.0,
             color: ColorGrade::default(),
             speed: 1.0,
+            follow_face: false,
         }
     }
 
@@ -655,6 +662,7 @@ mod tests {
             has_video: true,
             has_audio: audio,
             still: false,
+            faces: None,
         })
     }
 

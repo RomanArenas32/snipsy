@@ -37,6 +37,7 @@ fn add(tl: &mut Timeline, path: &PathBuf) -> AssetId {
         has_video: true,
         has_audio: true,
         still: false,
+        faces: None,
     })
 }
 
@@ -147,6 +148,7 @@ fn exports_vertical_reel_with_text_and_audio() {
         has_video: true,
         has_audio: true,
         still: false,
+        faces: None,
     });
     // Reel vertical: el video horizontal "rellena" el lienzo 9:16.
     tl.width = 360;
@@ -216,6 +218,7 @@ fn bench_reel_1080x1920_10s() {
         has_video: true,
         has_audio: true,
         still: false,
+        faces: None,
     });
     tl.width = 1080;
     tl.height = 1920;
@@ -329,6 +332,7 @@ fn exports_brand_logo_and_call_to_action() {
         has_video: true,
         has_audio: false,
         still: true,
+        faces: None,
     });
     kit.place_logo(&mut tl, logo_asset).unwrap();
     assert_eq!(tl.duration(), 120);
@@ -372,4 +376,201 @@ fn exports_brand_logo_and_call_to_action() {
     assert!(n > 3000, "llamada a la acción visible: {n} px amarillos");
     let center = px(&after, 320, 180);
     assert!(center[0] > 180 && center[1] < 60, "el video sigue detrás: {center:?}");
+}
+
+fn audio_file(name: &str, expr: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("snipsy_duck_{name}.m4a"));
+    let ok = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg(format!("aevalsrc={expr}:s=48000:d=5"))
+        .args(["-c:a", "aac", "-b:a", "192k"])
+        .arg(&path)
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(ok);
+    path
+}
+
+/// Amplitud de la frecuencia `f` en un tramo (Goertzel), para separar música y voz.
+fn tone(path: &PathBuf, t: f64, f: f64) -> f64 {
+    let mut r = AudioReader::open(path, 48_000, 1).unwrap();
+    let mut buf = vec![0.0f32; 4800];
+    r.mix_into(t, &mut buf, 1.0).unwrap();
+    let w = 2.0 * std::f64::consts::PI * f / 48_000.0;
+    let (mut s1, mut s2) = (0.0f64, 0.0f64);
+    for x in &buf {
+        let s0 = *x as f64 + 2.0 * w.cos() * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    (s1 * s1 + s2 * s2 - 2.0 * w.cos() * s1 * s2).sqrt() * 2.0 / buf.len() as f64
+}
+
+#[test]
+fn ducks_music_under_voice() {
+    use snipsy_core::{ducking, DuckSettings, TrackRef};
+    if snipsy_render::headless_device().is_none() {
+        eprintln!("sin GPU; se omite");
+        return;
+    }
+    let voice = audio_file("voice", "0.5*sin(2*PI*440*t)*(between(t\\,1\\,2)+between(t\\,3\\,4))");
+    let music = audio_file("music", "0.3*sin(2*PI*880*t)");
+    let mut tl = Timeline::new();
+    let add_audio = |tl: &mut Timeline, path: &PathBuf| {
+        let info = MediaInfo::probe(path).unwrap();
+        tl.add_asset(Asset {
+            id: AssetId(0),
+            path: path.clone(),
+            name: "a".into(),
+            duration: info.duration,
+            fps: 30.0,
+            width: 0,
+            height: 0,
+            has_video: false,
+            has_audio: true,
+            still: false,
+            faces: None,
+        })
+    };
+    let (v, m) = (add_audio(&mut tl, &voice), add_audio(&mut tl, &music));
+    tl.insert_asset(v, 0, 0, 0);
+    tl.insert_asset(m, 0, 0, 1);
+    let track = TrackRef::audio(1);
+
+    let s = DuckSettings::default();
+    let levels = snipsy_media::loudness::levels_without(&tl, track);
+    let regions = ducking::voice_regions(&levels, tl.fps, &s);
+    // Dos frases (la pausa de 1 s es más larga que `hold`), con un cuadro de margen por el códec.
+    assert_eq!(regions.len(), 2, "{regions:?}");
+    for ((a, b), (ea, eb)) in regions.iter().zip([(30, 60), (90, 120)]) {
+        assert!((a - ea).abs() <= 1 && (b - eb).abs() <= 1, "{regions:?}");
+    }
+    assert_eq!(ducking::apply_ducking(&mut tl, track, &regions, &s), 1);
+
+    let path = std::env::temp_dir().join("snipsy_export_duck.mp4");
+    let settings = ExportSettings { path: path.clone(), codec: VideoCodec::H264, quality: Quality::High, hardware: true };
+    export_blocking(&tl, &settings).unwrap();
+
+    let full = tone(&path, 0.4, 880.0);
+    let ducked = tone(&path, 1.4, 880.0);
+    // Entre el fin de la subida (2,6 s) y el inicio de la próxima bajada (2,75 s).
+    let between = tone(&path, 2.62, 880.0);
+    let ducked2 = tone(&path, 3.4, 880.0);
+    eprintln!("música: {full:.3} → con voz {ducked:.3} → pausa {between:.3} → con voz {ducked2:.3}");
+    assert!((full - 0.3).abs() < 0.03, "música a volumen normal: {full}");
+    // −12 dB ≈ ×0,25.
+    for d in [ducked, ducked2] {
+        assert!((d / full - 0.251).abs() < 0.04, "música bajo la voz: {d} / {full}");
+    }
+    assert!((between / full - 1.0).abs() < 0.08, "vuelve a subir en la pausa: {between}");
+    let v = tone(&path, 1.4, 440.0);
+    assert!((v - 0.5).abs() < 0.05, "la voz no se toca: {v}");
+}
+
+#[test]
+fn detects_real_speech_for_ducking() {
+    use snipsy_core::{ducking, DuckSettings, TrackRef};
+    let aiff = std::env::temp_dir().join("snipsy_duck_speech.aiff");
+    let ok = Command::new("say")
+        .args(["-v", "Paulina", "-o"])
+        .arg(&aiff)
+        .arg("Hola a todos, bienvenidos a nuestra tienda. [[slnc 2000]] Hoy tenemos ofertas increíbles para ti.")
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("sin voz del sistema; se omite");
+        return;
+    }
+    let info = MediaInfo::probe(&aiff).unwrap();
+    let mut tl = Timeline::new();
+    let a = tl.add_asset(Asset {
+        id: AssetId(0),
+        path: aiff.clone(),
+        name: "voz".into(),
+        duration: info.duration,
+        fps: 30.0,
+        width: 0,
+        height: 0,
+        has_video: false,
+        has_audio: true,
+        still: false,
+        faces: None,
+    });
+    tl.insert_asset(a, 30, 0, 0);
+    let levels = snipsy_media::loudness::levels_without(&tl, TrackRef::audio(1));
+    let regions = ducking::voice_regions(&levels, tl.fps, &DuckSettings::default());
+    eprintln!("{:.2} s de audio, tramos: {regions:?}", info.duration);
+    // Dos frases separadas por 2 s de silencio; las pausas entre palabras no cortan el tramo.
+    assert_eq!(regions.len(), 2, "{regions:?}");
+    assert!((regions[0].0 - 30).abs() <= 6, "empieza con la voz: {regions:?}");
+    let gap = regions[1].0 - regions[0].1;
+    assert!((50..=70).contains(&gap), "silencio de ~2 s: {gap} cuadros");
+}
+
+#[test]
+fn exports_reframed_formats() {
+    let Some(red) = color_clip("red", "0xE02020") else { return };
+    if snipsy_render::headless_device().is_none() {
+        eprintln!("sin GPU; se omite");
+        return;
+    }
+    use snipsy_core::{BrandKit, Corner};
+    let logo = std::env::temp_dir().join("snipsy_brand_logo.png");
+    assert!(Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0x00FF00:size=100x50", "-frames:v", "1"])
+        .arg(&logo)
+        .status()
+        .is_ok_and(|s| s.success()));
+    // Anuncio 16:9 (640×360): video a pantalla completa, logo arriba a la derecha y un título blanco.
+    let mut tl = Timeline::new();
+    let a = add(&mut tl, &red);
+    tl.width = 640;
+    tl.height = 360;
+    tl.append_asset(a);
+    tl.insert_text(0, 1, 90, TextStyle { text: "OFERTA".into(), size: 60.0, outline: None, ..Default::default() });
+    let l = tl.add_asset(Asset {
+        id: AssetId(0),
+        path: logo.clone(),
+        name: "logo".into(),
+        duration: 5.0,
+        fps: 30.0,
+        width: 100,
+        height: 50,
+        has_video: true,
+        has_audio: false,
+        still: true,
+        faces: None,
+    });
+    BrandKit { logo_corner: Corner::TopRight, logo_size: 0.2, margin: 0.05, ..Default::default() }.place_logo(&mut tl, l).unwrap();
+
+    for (w, h) in [(360u32, 640u32), (360, 360)] {
+        let v = snipsy_core::reframe::reframe(&tl, w, h, false);
+        let path = std::env::temp_dir().join(format!("snipsy_reframe_{w}x{h}.mp4"));
+        let settings = ExportSettings { path: path.clone(), codec: VideoCodec::H264, quality: Quality::High, hardware: true };
+        export_blocking(&v, &settings).unwrap();
+        let info = MediaInfo::probe(&path).unwrap();
+        assert_eq!((info.width, info.height), (w, h));
+        let mut r = VideoReader::open(&path, (w, h)).unwrap();
+        let img = r.frame_at(0.5).unwrap().unwrap();
+        let px = |x: u32, y: u32| {
+            let i = (y as usize * img.width + x as usize) * 4;
+            [img.rgba[i] as i32, img.rgba[i + 1] as i32, img.rgba[i + 2] as i32]
+        };
+        let red_px = |c: [i32; 3]| c[0] > 180 && c[1] < 70 && c[2] < 70;
+        let green = |c: [i32; 3]| c[1] > 200 && c[0] < 60;
+        let white = |c: [i32; 3]| c.iter().all(|v| *v > 200);
+        // El video llena todo el cuadro (sin franjas negras arriba ni abajo).
+        for (x, y) in [(w / 2, 4), (w / 2, h - 4), (4, h / 2), (w - 4, h / 2)] {
+            assert!(red_px(px(x, y)) || green(px(x, y)), "{w}x{h}: borde ({x}, {y}) = {:?}", px(x, y));
+        }
+        // Logo: 72×36 (20 % de 360) a 18 px de arriba y de la derecha.
+        assert!(green(px(w - 18 - 36, 18 + 18)), "{w}x{h}: logo {:?}", px(w - 54, 36));
+        assert!(!green(px(w - 10, 36)) && !green(px(w - 54, 60)), "{w}x{h}: tamaño del logo");
+        // El título sigue en el centro.
+        let whites = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).filter(|&(x, y)| white(px(x, y))).collect::<Vec<_>>();
+        assert!(whites.len() > 200, "{w}x{h}: texto visible");
+        let cx = whites.iter().map(|p| p.0 as f64).sum::<f64>() / whites.len() as f64;
+        let cy = whites.iter().map(|p| p.1 as f64).sum::<f64>() / whites.len() as f64;
+        assert!((cx - w as f64 / 2.0).abs() < 8.0 && (cy - h as f64 / 2.0).abs() < 8.0, "{w}x{h}: centro del texto ({cx:.0}, {cy:.0})");
+    }
 }

@@ -12,7 +12,9 @@ use snipsy_export::{ExportEvent, ExportJob, ExportSettings, Quality, VideoCodec}
 use snipsy_media::MediaInfo;
 
 use crate::brand_ui::{BrandAction, BrandUi};
+use crate::faces_ui::Faces;
 use crate::inspector;
+use crate::library_ui::{LibraryAction, LibraryUi};
 use crate::player::Player;
 use crate::proxies_ui::Proxies;
 use crate::subtitles_ui::{SubtitleResult, SubtitlesUi};
@@ -35,12 +37,36 @@ struct ExportDialog {
     codec: VideoCodec,
     quality: Quality,
     hardware: bool,
+    /// Formatos a exportar: (nombre, ancho, alto, elegido). El primero es el del proyecto.
+    formats: Vec<(String, u32, u32, bool)>,
+    /// Seguir rostros en los formatos reencuadrados.
+    follow: bool,
 }
 
-impl Default for ExportDialog {
-    fn default() -> Self {
-        Self { codec: VideoCodec::H264, quality: Quality::High, hardware: true }
+impl ExportDialog {
+    fn new(tl: &Timeline, follow: bool) -> Self {
+        let mut formats = vec![(format!("Actual · {}×{}", tl.width, tl.height), tl.width, tl.height, true)];
+        for (name, w, h) in FORMATS {
+            if (*w, *h) != (tl.width, tl.height) {
+                formats.push(((*name).to_owned(), *w, *h, false));
+            }
+        }
+        Self { codec: VideoCodec::H264, quality: Quality::High, hardware: true, formats, follow }
     }
+
+    fn selected(&self) -> Vec<(u32, u32)> {
+        self.formats.iter().filter(|f| f.3).map(|f| (f.1, f.2)).collect()
+    }
+}
+
+/// Sufijo del archivo para un formato: «9x16», «1x1», «16x9_4K».
+fn format_suffix(w: u32, h: u32) -> String {
+    fn gcd(a: u32, b: u32) -> u32 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let g = gcd(w, h).max(1);
+    let k = if w.max(h) >= 3840 { "_4K" } else { "" };
+    format!("{}x{}{k}", w / g, h / g)
 }
 
 struct RunningExport {
@@ -49,6 +75,12 @@ struct RunningExport {
     progress: (Frame, Frame),
     eta: f64,
     encoder: String,
+    /// Formatos que faltan (timeline ya reencuadrado, archivo).
+    queue: std::collections::VecDeque<(Timeline, PathBuf)>,
+    settings: (VideoCodec, Quality, bool),
+    done: Vec<PathBuf>,
+    count: usize,
+    secs: f64,
 }
 
 pub struct SnipsyApp {
@@ -67,6 +99,14 @@ pub struct SnipsyApp {
     subtitles: SubtitlesUi,
     brand: BrandUi,
     proxies: Proxies,
+    library: LibraryUi,
+    /// Panel izquierdo: `true` = Biblioteca, `false` = medios del proyecto.
+    show_library: bool,
+    faces: Faces,
+    /// Al reencuadrar (cambiar de formato o exportar otros), seguir rostros.
+    follow_faces: bool,
+    /// Videos cuyo análisis de rostros necesita la exportación en curso de configurar.
+    face_extra: Vec<AssetId>,
 }
 
 impl SnipsyApp {
@@ -80,6 +120,8 @@ impl SnipsyApp {
         let player = Player::new(audio, Arc::new(move || repaint_ctx.request_repaint()));
         let proxy_ctx = cc.egui_ctx.clone();
         let proxies = Proxies::new(Arc::new(move || proxy_ctx.request_repaint()));
+        let faces_ctx = cc.egui_ctx.clone();
+        let faces = Faces::new(Arc::new(move || faces_ctx.request_repaint()));
         let mut app = Self {
             timeline: Timeline::new(),
             history: History::default(),
@@ -96,6 +138,11 @@ impl SnipsyApp {
             subtitles: SubtitlesUi::default(),
             brand: BrandUi::new(),
             proxies,
+            library: LibraryUi::new(&cc.egui_ctx),
+            show_library: false,
+            faces,
+            follow_faces: true,
+            face_extra: Vec::new(),
         };
         if !app.viewer.has_gpu() {
             app.status = "Aviso: no hay GPU (wgpu); el visor no podrá componer.".into();
@@ -140,32 +187,9 @@ impl SnipsyApp {
         let mut added: Vec<AssetId> = Vec::new();
         let mut errors = Vec::new();
         for path in paths {
-            if is_image(&path) {
-                match self.add_image(path) {
-                    Ok(id) => added.push(id),
-                    Err(e) => errors.push(e),
-                }
-                continue;
-            }
-            match MediaInfo::probe(&path) {
-                Ok(info) if info.has_video || info.has_audio => {
-                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    let id = self.timeline.add_asset(Asset {
-                        id: AssetId(0),
-                        path,
-                        name,
-                        duration: info.duration,
-                        fps: info.fps,
-                        width: info.width,
-                        height: info.height,
-                        has_video: info.has_video,
-                        has_audio: info.has_audio,
-                        still: false,
-                    });
-                    added.push(id);
-                }
-                Ok(_) => errors.push(format!("{}: sin video ni audio", path.display())),
-                Err(e) => errors.push(format!("{e:#}")),
+            match self.import_file(path) {
+                Ok(id) => added.push(id),
+                Err(e) => errors.push(e),
             }
         }
         if added.is_empty() && errors.is_empty() {
@@ -193,6 +217,110 @@ impl SnipsyApp {
         };
     }
 
+    /// Agrega un archivo (video, audio o imagen) a los medios del proyecto.
+    fn import_file(&mut self, path: PathBuf) -> Result<AssetId, String> {
+        if is_image(&path) {
+            return self.add_image(path);
+        }
+        match MediaInfo::probe(&path) {
+            Ok(info) if info.has_video || info.has_audio => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                Ok(self.timeline.add_asset(Asset {
+                    id: AssetId(0),
+                    path,
+                    name,
+                    duration: info.duration,
+                    fps: info.fps,
+                    width: info.width,
+                    height: info.height,
+                    has_video: info.has_video,
+                    has_audio: info.has_audio,
+                    still: false,
+                    faces: None,
+                }))
+            }
+            Ok(_) => Err(format!("{}: sin video ni audio", path.display())),
+            Err(e) => Err(format!("{e:#}")),
+        }
+    }
+
+    /// Pone un archivo de la biblioteca en el cabezal: la música en la pista «Música»,
+    /// los efectos en una pista de audio libre y videos/imágenes en una pista de video libre.
+    fn library_add(&mut self, item: snipsy_core::library::LibraryItem) {
+        use snipsy_core::library::Category;
+        use snipsy_core::TrackKind;
+        let before = self.timeline.clone();
+        let asset = match self.import_file(item.path.clone()) {
+            Ok(a) => a,
+            Err(e) => {
+                self.timeline = before;
+                self.status = format!("No se pudo agregar: {e}");
+                return;
+            }
+        };
+        let at = self.playhead();
+        let len = self.timeline.asset_frames(asset);
+        let tl = &mut self.timeline;
+        let free = |t: &snipsy_core::Track| !t.clips.iter().any(|c| c.start < at + len && c.end() > at);
+        let reserved = |t: &snipsy_core::Track| t.name == snipsy_core::brand::LOGO_TRACK || t.name == snipsy_subtitles::TRACK_NAME;
+        let (vt, at_track) = match item.category {
+            Category::Music => {
+                let i = match tl.audio_tracks.iter().position(|t| t.name == "Música") {
+                    Some(i) => i,
+                    None => {
+                        let i = tl.add_track(TrackKind::Audio);
+                        tl.audio_tracks[i].name = "Música".into();
+                        i
+                    }
+                };
+                (0, i)
+            }
+            Category::Sfx => {
+                let i = (1..tl.audio_tracks.len())
+                    .find(|i| free(&tl.audio_tracks[*i]) && tl.audio_tracks[*i].name != "Música")
+                    .unwrap_or_else(|| tl.add_track(TrackKind::Audio));
+                (0, i)
+            }
+            _ => {
+                // Encima del video principal (como plano de apoyo), en una pista libre.
+                let v = (1..tl.video_tracks.len())
+                    .find(|i| free(&tl.video_tracks[*i]) && !reserved(&tl.video_tracks[*i]))
+                    .unwrap_or_else(|| tl.add_track(TrackKind::Video));
+                let a = (1..tl.audio_tracks.len()).find(|i| free(&tl.audio_tracks[*i])).unwrap_or_else(|| tl.add_track(TrackKind::Audio));
+                (v, a)
+            }
+        };
+        let ids = tl.insert_asset(asset, at, vt, at_track);
+        self.history.checkpoint(&before);
+        self.view.selection = ids.into_iter().collect();
+        self.commit();
+        self.status = format!("{} «{}» agregado en el cabezal.", item.category.icon(), item.name);
+    }
+
+    fn library_action(&mut self, action: LibraryAction) {
+        match action {
+            LibraryAction::AddAtPlayhead(item) => {
+                self.player.pause();
+                self.library_add(item);
+            }
+            LibraryAction::OpenProject(path) => {
+                if self.confirm_discard() {
+                    self.load_project(path);
+                }
+            }
+            LibraryAction::UseAsTemplate(path) => {
+                if self.confirm_discard() {
+                    self.load_project(path);
+                    // Copia sin guardar: «Guardar» pedirá un archivo nuevo.
+                    self.project_path = None;
+                    self.dirty = true;
+                    self.status = "Plantilla abierta como proyecto nuevo: cambia los clips y guarda con otro nombre.".into();
+                }
+            }
+            LibraryAction::SaveProject(name) => self.library.save_project(&name, &self.timeline),
+        }
+    }
+
     /// Agrega una imagen fija (logo, foto) al proyecto.
     fn add_image(&mut self, path: PathBuf) -> Result<AssetId, String> {
         let img = snipsy_render::load_image(&path)?;
@@ -208,6 +336,7 @@ impl SnipsyApp {
             has_video: true,
             has_audio: false,
             still: true,
+            faces: None,
         }))
     }
 
@@ -493,6 +622,14 @@ impl eframe::App for SnipsyApp {
         if let Some(frame) = self.player.tick() {
             self.viewer.set_frame(frame);
         }
+        let proxies = self.proxies.active(&self.timeline);
+        let (message, changed) = self.faces.sync(&mut self.timeline, &self.face_extra, &proxies);
+        if let Some(m) = message {
+            self.status = m;
+        }
+        if changed {
+            self.dirty = true;
+        }
         let (message, ready) = self.proxies.poll(&self.timeline);
         if let Some(m) = message {
             self.status = m;
@@ -616,15 +753,43 @@ impl eframe::App for SnipsyApp {
             if let Some(f) = out.seek {
                 self.seek_frame(f);
             }
+            if let Some((path, frame, vt, at)) = out.drop_file {
+                let before = self.timeline.clone();
+                match self.import_file(path) {
+                    Ok(asset) => {
+                        let ids = self.timeline.insert_asset(asset, frame, vt, at);
+                        self.history.checkpoint(&before);
+                        self.view.selection = ids.into_iter().collect();
+                        self.commit();
+                    }
+                    Err(e) => self.status = format!("No se pudo agregar: {e}"),
+                }
+            }
         });
 
-        egui::Panel::left("media_pool").resizable(true).default_size(240.0).show(ui, |ui| {
-            self.media_pool(ui);
+        egui::Panel::left("media_pool").resizable(true).default_size(270.0).show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.show_library, false, RichText::new("Proyecto").strong());
+                ui.selectable_value(&mut self.show_library, true, RichText::new("📚 Biblioteca").strong())
+                    .on_hover_text("Tu música, efectos, logos, videos y ediciones, en todos los proyectos");
+            });
+            ui.separator();
+            if self.show_library {
+                if let Some(action) = self.library.show(ui, &self.timeline) {
+                    self.library_action(action);
+                }
+                if let Some(m) = self.library.message.take() {
+                    self.status = m;
+                }
+            } else {
+                self.media_pool(ui);
+            }
         });
 
         egui::Panel::right("inspector").resizable(true).default_size(290.0).show(ui, |ui| {
             let playhead = self.playhead();
-            let out = inspector::show(ui, &mut self.timeline, &mut self.history, &self.view.selection, playhead);
+            let out = inspector::show(ui, &mut self.timeline, &mut self.history, &self.view.selection, playhead, &self.faces, self.follow_faces);
             if out.rebuild {
                 self.commit();
             } else if out.changed {
@@ -632,6 +797,9 @@ impl eframe::App for SnipsyApp {
             }
             if let Some(f) = out.seek {
                 self.seek_frame(f);
+            }
+            if let Some(m) = out.message {
+                self.status = m;
             }
         });
 
@@ -655,7 +823,9 @@ impl SnipsyApp {
 
     fn open_export_dialog(&mut self) {
         if self.export.is_none() && self.timeline.duration() > 0 {
-            self.export_dialog.get_or_insert_with(ExportDialog::default);
+            if self.export_dialog.is_none() {
+                self.export_dialog = Some(ExportDialog::new(&self.timeline, self.follow_faces));
+            }
         }
     }
 
@@ -674,16 +844,41 @@ impl SnipsyApp {
             path.set_extension("mp4");
         }
         self.player.pause();
-        let settings = ExportSettings { path: path.clone(), codec: opts.codec, quality: opts.quality, hardware: opts.hardware };
-        let total = self.timeline.duration();
+        let formats = opts.selected();
+        let mut queue: std::collections::VecDeque<(Timeline, PathBuf)> = if formats.len() == 1 {
+            let (w, h) = formats[0];
+            [(snipsy_core::reframe::reframe(&self.timeline, w, h, opts.follow), path)].into()
+        } else {
+            // Varios formatos: «Anuncio_9x16.mp4», «Anuncio_1x1.mp4»…
+            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "video".into());
+            formats
+                .iter()
+                .map(|&(w, h)| {
+                    let file = path.with_file_name(format!("{stem}_{}.mp4", format_suffix(w, h)));
+                    (snipsy_core::reframe::reframe(&self.timeline, w, h, opts.follow), file)
+                })
+                .collect()
+        };
+        let count = queue.len();
+        let Some((tl, path)) = queue.pop_front() else { return };
+        let settings = (opts.codec, opts.quality, opts.hardware);
         self.export = Some(RunningExport {
-            job: ExportJob::start(self.timeline.clone(), settings),
+            job: Self::spawn_export(tl.clone(), &path, settings),
             path,
-            progress: (0, total),
+            progress: (0, tl.duration()),
             eta: f64::NAN,
             encoder: String::new(),
+            queue,
+            settings,
+            done: Vec::new(),
+            count,
+            secs: 0.0,
         });
         self.last_export = None;
+    }
+
+    fn spawn_export(tl: Timeline, path: &std::path::Path, (codec, quality, hardware): (VideoCodec, Quality, bool)) -> ExportJob {
+        ExportJob::start(tl, ExportSettings { path: path.to_owned(), codec, quality, hardware })
     }
 
     fn poll_export(&mut self) {
@@ -705,8 +900,26 @@ impl SnipsyApp {
         }
         match finished {
             Some(Ok((path, secs))) => {
-                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                self.status = format!("✅ Exportado en {secs:.1} s ({}): {}", human_size(size), path.display());
+                run.done.push(path.clone());
+                run.secs += secs;
+                if let Some((tl, next)) = run.queue.pop_front() {
+                    // Siguiente formato.
+                    run.job = Self::spawn_export(tl.clone(), &next, run.settings);
+                    run.path = next;
+                    run.progress = (0, tl.duration());
+                    run.eta = f64::NAN;
+                    return;
+                }
+                let size: u64 = run.done.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+                self.status = if run.done.len() == 1 {
+                    format!("✅ Exportado en {secs:.1} s ({}): {}", human_size(size), path.display())
+                } else {
+                    let names: Vec<String> = run.done.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+                    format!("✅ {} formatos exportados en {:.1} s ({}): {}", run.done.len(), run.secs, human_size(size), names.join(", "))
+                };
+                for p in &run.done {
+                    self.library.add_export(p);
+                }
                 self.last_export = Some(path);
                 self.export = None;
             }
@@ -728,6 +941,9 @@ impl SnipsyApp {
             egui::Window::new("Exportando…").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
                 ui.set_min_width(360.0);
                 ui.label(RichText::new(run.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).strong());
+                if run.count > 1 {
+                    ui.label(RichText::new(format!("Formato {} de {}", run.done.len() + 1, run.count)).small());
+                }
                 ui.add(egui::ProgressBar::new(frac).show_percentage());
                 let eta = if run.eta.is_finite() { format!(" · quedan ~{:.0} s", run.eta.ceil()) } else { String::new() };
                 ui.label(RichText::new(format!("Cuadro {done} de {total}{eta}")).small());
@@ -750,6 +966,8 @@ impl SnipsyApp {
         let tl = &self.timeline;
         let mut open = true;
         let mut go = false;
+        let mut face_wait = false;
+        let mut face_extra = Vec::new();
         egui::Window::new("Exportar video").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
             ui.set_min_width(380.0);
             let secs = tl.frame_to_secs(tl.duration());
@@ -783,17 +1001,61 @@ impl SnipsyApp {
                 ui.end_row();
             });
             ui.add_space(6.0);
-            let mbps = snipsy_export::video_bitrate(tl, opts.codec, opts.quality) as f64 / 1e6;
-            let size = snipsy_export::estimated_size(tl, opts.codec, opts.quality);
-            ui.label(RichText::new(format!("≈ {mbps:.1} Mbps · tamaño estimado {}", human_size(size))).small().color(Color32::GRAY));
+            ui.label(RichText::new("Formatos").strong());
+            ui.label(RichText::new("Cada formato extra se reencuadra solo: el video llena la pantalla y textos y logo se reubican.").small().color(Color32::GRAY));
+            for f in opts.formats.iter_mut() {
+                ui.checkbox(&mut f.3, f.0.as_str());
+            }
+            ui.checkbox(&mut opts.follow, "🎯 Seguir rostros en los formatos reencuadrados");
+            let selected = opts.selected();
+            // Videos que van a seguir rostros y todavía no están analizados.
+            let mut pending: Vec<AssetId> = Vec::new();
+            if opts.follow {
+                for &(w, h) in &selected {
+                    let v = snipsy_core::reframe::reframe(tl, w, h, true);
+                    for c in v.video_tracks.iter().flat_map(|t| &t.clips).filter(|c| c.follow_face) {
+                        if v.asset(c.asset).is_some_and(|a| a.faces.is_none()) && !pending.contains(&c.asset) {
+                            pending.push(c.asset);
+                        }
+                    }
+                }
+            }
+            if !pending.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(format!("Buscando rostros en {} video(s)…", pending.len())).small());
+                });
+            }
+            face_wait = !pending.is_empty();
+            face_extra = pending;
+            let size: u64 = selected
+                .iter()
+                .map(|&(w, h)| {
+                    let mut t = tl.clone();
+                    (t.width, t.height) = (w, h);
+                    snipsy_export::estimated_size(&t, opts.codec, opts.quality)
+                })
+                .sum();
+            if selected.len() > 1 {
+                ui.label(RichText::new(format!("{} archivos · tamaño estimado total {}", selected.len(), human_size(size))).small().color(Color32::GRAY));
+            } else {
+                let mbps = snipsy_export::video_bitrate(tl, opts.codec, opts.quality) as f64 / 1e6;
+                ui.label(RichText::new(format!("≈ {mbps:.1} Mbps · tamaño estimado {}", human_size(size))).small().color(Color32::GRAY));
+            }
             ui.add_space(8.0);
-            if ui.button(RichText::new("Exportar…").strong()).clicked() {
+            if ui.add_enabled(!selected.is_empty() && !face_wait, egui::Button::new(RichText::new("Exportar…").strong())).clicked() {
                 go = true;
             }
         });
+        self.face_extra = face_extra;
+        if face_wait {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         if !open {
             self.export_dialog = None;
+            self.face_extra.clear();
         } else if go {
+            self.face_extra.clear();
             self.start_export();
         }
     }
@@ -817,12 +1079,16 @@ impl SnipsyApp {
         let current = FORMATS.iter().find(|f| f.1 == w && f.2 == h);
         let label = current.map(|f| f.0.split(' ').next().unwrap_or(f.0).to_owned()).unwrap_or_else(|| format!("{w}x{h}"));
         egui::ComboBox::from_id_salt("toolbar_format").selected_text(format!("Formato {label}")).show_ui(ui, |ui| {
+            ui.checkbox(&mut self.follow_faces, "🎯 Seguir rostros al reencuadrar")
+                .on_hover_text("Si el video queda recortado (p. ej. horizontal → vertical), el recorte sigue a la persona");
+            ui.separator();
             for (name, fw, fh) in FORMATS {
                 if ui.selectable_label(w == *fw && h == *fh, *name).clicked() && (w, h) != (*fw, *fh) {
                     self.history.checkpoint(&self.timeline);
-                    self.timeline.width = *fw;
-                    self.timeline.height = *fh;
+                    // Los videos siguen llenando la pantalla; textos y logo se reubican.
+                    self.timeline = snipsy_core::reframe::reframe(&self.timeline, *fw, *fh, self.follow_faces);
                     self.dirty = true;
+                    self.status = format!("Formato {name}: contenido reencuadrado. Ajusta lo que quieras; ⌘Z vuelve al anterior.");
                 }
             }
         });

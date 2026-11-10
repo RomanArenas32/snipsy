@@ -408,6 +408,15 @@ impl Timeline {
             .collect()
     }
 
+    /// Seguimiento de rostro: reemplaza la posición por la que centra a la persona.
+    fn apply_follow(&self, clip: &Clip, frame: Frame, tr: &mut Transform) {
+        let Some(asset) = self.asset(clip.asset) else { return };
+        let Some(face) = asset.faces.as_ref().and_then(|f| f.at(clip.source_frame(frame) as f64 / self.fps)) else { return };
+        let src = (asset.width as f32, asset.height as f32);
+        let canvas = (self.width as f32, self.height as f32);
+        (tr.x, tr.y) = crate::follow::follow_offset(src, canvas, tr.scale, face, (tr.x, tr.y));
+    }
+
     /// Capas de video visibles en `frame` (de abajo hacia arriba) con su
     /// transformación evaluada; la opacidad ya incluye fundidos y transiciones.
     pub fn video_layers_at(&self, frame: Frame) -> Vec<(Span<'_>, Transform)> {
@@ -417,6 +426,9 @@ impl Timeline {
             .filter(|s| s.contains(frame))
             .map(|s| {
                 let mut tr = s.clip.transform_at(frame);
+                if s.clip.follow_face {
+                    self.apply_follow(s.clip, frame, &mut tr);
+                }
                 let fade_t = t.clamp(s.clip.start as f64, (s.clip.end() - 1) as f64);
                 tr.opacity *= s.clip.fade_at(fade_t, true) * s.trans_in_at(t);
                 (s, tr)
@@ -443,6 +455,7 @@ mod tests {
             has_video: true,
             has_audio: true,
             still: false,
+            faces: None,
         });
         for _ in 0..n {
             tl.append_asset(a);

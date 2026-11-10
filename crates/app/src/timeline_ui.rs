@@ -37,6 +37,8 @@ pub enum Tool {
 pub struct TimelineOutput {
     pub seek: Option<Frame>,
     pub changed: bool,
+    /// Archivo soltado desde la biblioteca: (archivo, cuadro, pista de video, pista de audio).
+    pub drop_file: Option<(std::path::PathBuf, Frame, usize, usize)>,
 }
 
 enum Drag {
@@ -172,6 +174,18 @@ impl TimelineView {
             let row = rows.iter().find(|r| p.y >= r.y0 && p.y < r.y1).copied();
             Some((self.snap(tl, self.x_to_frame(content, p.x).round() as Frame, &HashSet::new(), playhead), row))
         });
+        let track_for = |row: Option<Row>, tl: &Timeline| match row.map(|r| r.track) {
+            Some(TrackRef { kind: TrackKind::Video, index }) => (index, index.min(tl.audio_tracks.len().saturating_sub(1))),
+            Some(TrackRef { kind: TrackKind::Audio, index }) => (0, index),
+            None => (0, 0),
+        };
+        if let Some(file) = response.dnd_release_payload::<crate::library_ui::LibraryDrop>() {
+            if let Some((frame, row)) = drop_target {
+                let (vt, at) = track_for(row, tl);
+                out.drop_file = Some((file.0.clone(), frame.max(0), vt, at));
+            }
+        }
+        let library_hover = response.dnd_hover_payload::<crate::library_ui::LibraryDrop>().is_some();
         if let Some(asset) = response.dnd_release_payload::<AssetId>() {
             if let Some((frame, row)) = drop_target {
                 let (vt, at) = match row.map(|r| r.track) {
@@ -198,7 +212,13 @@ impl TimelineView {
             );
             painter.rect_stroke(r, 3.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
         }
-        self.draw_ruler(&painter, tl, rect, content);
+        if let (true, Some((frame, Some(row)))) = (library_hover, drop_target) {
+            // Duración aún desconocida: marcar dónde empezará.
+            let x = self.frame_to_x(content, frame as f64);
+            let r = Rect::from_min_max(pos2(x, row.y0 + 2.0), pos2(x + 60.0, row.y1 - 2.0));
+            painter.rect_stroke(r, 3.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
+        }
+                self.draw_ruler(&painter, tl, rect, content);
         self.draw_headers(&painter, tl, &rows, rect);
 
         let px = self.frame_to_x(content, playhead as f64);
