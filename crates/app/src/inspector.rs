@@ -78,7 +78,7 @@ pub fn show(
 
     egui::ScrollArea::vertical().show(ui, |ui| match target {
         Some(id) => clip_ui(ui, tl, id, playhead, faces, &mut undo, &mut out),
-        None => project_ui(ui, tl, follow_faces, &mut undo),
+        None => project_ui(ui, tl, follow_faces, &mut undo, &mut out),
     });
     out.changed = undo.changed;
     out
@@ -94,7 +94,7 @@ fn hint(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).small().color(Color32::GRAY));
 }
 
-fn project_ui(ui: &mut Ui, tl: &mut Timeline, follow_faces: bool, undo: &mut Undo) {
+fn project_ui(ui: &mut Ui, tl: &mut Timeline, follow_faces: bool, undo: &mut Undo, out: &mut InspectorOutput) {
     ui.label(RichText::new("Proyecto").heading());
     section(ui, "Formato");
     let current = FORMATS.iter().find(|(_, w, h)| *w == tl.width && *h == tl.height).map(|f| f.0);
@@ -120,6 +120,8 @@ fn project_ui(ui: &mut Ui, tl: &mut Timeline, follow_faces: bool, undo: &mut Und
     tl.width = tl.width.max(16) & !1;
     tl.height = tl.height.max(16) & !1;
     ui.label(RichText::new(format!("{:.3} fps", tl.fps)).color(Color32::GRAY));
+
+    silence_ui(ui, tl, undo, out);
 
     section(ui, "Consejo");
     hint(
@@ -715,6 +717,85 @@ fn audio_ui(ui: &mut Ui, tl: &mut Timeline, id: ClipId, standalone: bool, playhe
     if standalone {
         ducking_ui(ui, tl, track, undo, out);
     }
+}
+
+/// Corta los silencios del timeline (sin tocar la pista `music` ni el logo) y
+/// devuelve un mensaje para el usuario.
+pub fn cut_silences(tl: &mut Timeline, s: &snipsy_core::SilenceSettings, music: Option<usize>) -> String {
+    use snipsy_core::silence;
+    let music = music.filter(|m| *m < tl.audio_tracks.len());
+    let exclude = music.map(TrackRef::audio);
+    let levels = snipsy_media::loudness::levels(tl, exclude);
+    let covered = silence::audio_coverage(tl, exclude);
+    let ranges = silence::silent_ranges(&levels, &covered, tl.fps, s);
+    let ducked = music.is_some_and(|m| tl.audio_tracks[m].clips.iter().any(|c| !c.anim.volume.keys.is_empty()));
+    let keep = silence::continuous_tracks(tl, music);
+    let removed = silence::cut_ranges(tl, &ranges, &keep);
+    if ranges.is_empty() {
+        return "No se encontraron pausas para cortar (prueba con menos sensibilidad o una pausa mínima más corta).".into();
+    }
+    let mut m = format!("✂ {} pausa(s) cortada(s): {:.1} s menos. ⌘Z para deshacer.", ranges.len(), tl.frame_to_secs(removed));
+    if ducked {
+        m.push_str(" Vuelve a aplicar el ducking de la música.");
+    }
+    m
+}
+
+fn silence_ui(ui: &mut Ui, tl: &mut Timeline, undo: &mut Undo, out: &mut InspectorOutput) {
+    use snipsy_core::{silence, SilenceSettings};
+    section(ui, "✂ Cortar silencios");
+    let id = ui.make_persistent_id("silence_settings");
+    let mut s: SilenceSettings = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+    // `None` = adivinar la pista de música; `Some(None)` = ninguna.
+    let music_id = ui.make_persistent_id("silence_music");
+    let mut music: Option<Option<usize>> = ui.data_mut(|d| d.get_temp(music_id)).flatten();
+    let current_music = music.unwrap_or_else(|| silence::guess_music_track(tl)).filter(|m| *m < tl.audio_tracks.len());
+    egui::Grid::new("silence").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+        ui.label("Sensibilidad");
+        let mut sens = -s.threshold_db;
+        ui.add(egui::Slider::new(&mut sens, 25.0..=60.0).show_value(false))
+            .on_hover_text("Súbela si corta palabras dichas en voz baja; bájala si no corta pausas con ruido de fondo");
+        s.threshold_db = -sens;
+        ui.end_row();
+        ui.label("Pausa mínima");
+        ui.add(egui::Slider::new(&mut s.min_silence, 0.3..=2.0).suffix(" s").fixed_decimals(1))
+            .on_hover_text("Solo se cortan pausas al menos así de largas");
+        ui.end_row();
+        ui.label("Aire");
+        ui.add(egui::Slider::new(&mut s.padding, 0.0..=0.5).suffix(" s").fixed_decimals(2))
+            .on_hover_text("Lo que se deja antes y después de cada frase para que no suene cortado");
+        ui.end_row();
+        ui.label("Música");
+        let name = |i: usize| format!("A{} {}", i + 1, tl.audio_tracks[i].name);
+        egui::ComboBox::from_id_salt("silence_music_combo")
+            .selected_text(current_music.map(name).unwrap_or_else(|| "Ninguna".into()))
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(current_music.is_none(), "Ninguna").clicked() {
+                    music = Some(None);
+                }
+                for i in 0..tl.audio_tracks.len() {
+                    if ui.selectable_label(current_music == Some(i), name(i)).clicked() {
+                        music = Some(Some(i));
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Esta pista no se corta ni cuenta como voz: sigue sonando de corrido");
+        ui.end_row();
+    });
+    ui.data_mut(|d| {
+        d.insert_temp(id, s);
+        d.insert_temp(music_id, music);
+    });
+    let r = ui.button("✂ Cortar silencios").on_hover_text(
+        "Quita las pausas de todas las pistas y cierra los huecos (video, voz, textos y subtítulos). \
+         La música y el logo no se cortan. ⌘Z para deshacer.",
+    );
+    if undo.clicked(&r) {
+        out.message = Some(cut_silences(tl, &s, current_music));
+        out.rebuild = true;
+    }
+    hint(ui, "Ideal para videos hablados a cámara. Hazlo antes de agregar subtítulos, música o ducking.");
 }
 
 fn ducking_ui(ui: &mut Ui, tl: &mut Timeline, track: TrackRef, undo: &mut Undo, out: &mut InspectorOutput) {

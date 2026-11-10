@@ -508,6 +508,56 @@ fn detects_real_speech_for_ducking() {
 }
 
 #[test]
+fn cuts_silences_in_real_speech() {
+    use snipsy_core::{silence, SilenceSettings};
+    let aiff = std::env::temp_dir().join("snipsy_silence_speech.aiff");
+    let ok = Command::new("say")
+        .args(["-v", "Paulina", "-o"])
+        .arg(&aiff)
+        .arg("[[slnc 1000]] Hola a todos. [[slnc 1500]] Bienvenidos a la tienda. [[slnc 2000]] Hoy hay ofertas. [[slnc 1000]]")
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("sin voz del sistema; se omite");
+        return;
+    }
+    let info = MediaInfo::probe(&aiff).unwrap();
+    let mut tl = Timeline::new();
+    let a = tl.add_asset(Asset {
+        id: AssetId(0),
+        path: aiff.clone(),
+        name: "voz".into(),
+        duration: info.duration,
+        fps: 30.0,
+        width: 0,
+        height: 0,
+        has_video: false,
+        has_audio: true,
+        still: false,
+        faces: None,
+    });
+    tl.insert_asset(a, 0, 0, 0);
+    let s = SilenceSettings::default();
+    let original = snipsy_media::loudness::levels(&tl, None);
+    let voiced_before = original.iter().filter(|l| **l >= s.threshold_db).count();
+    let ranges = silence::silent_ranges(&original, &silence::audio_coverage(&tl, None), tl.fps, &s);
+    let before = tl.duration();
+    let removed = silence::cut_ranges(&mut tl, &ranges, &[]);
+    eprintln!("{:.2} s → {:.2} s, cortes: {ranges:?}", tl.frame_to_secs(before), tl.frame_to_secs(tl.duration()));
+    // Silencio inicial, dos pausas largas y el final.
+    assert_eq!(ranges.len(), 4, "{ranges:?}");
+    let secs = tl.frame_to_secs(removed);
+    // 1 + 1,5 + 2 + 1 = 5,5 s de silencio, menos el aire (≈ 0,15 s por lado de cada frase).
+    assert!((4.3..=5.4).contains(&secs), "se quitaron {secs:.2} s");
+    assert_eq!(tl.duration(), before - removed);
+    // Ya no quedan pausas largas, y las tres frases siguen ahí, completas.
+    let levels = snipsy_media::loudness::levels(&tl, None);
+    assert!(silence::silent_ranges(&levels, &silence::audio_coverage(&tl, None), tl.fps, &s).is_empty());
+    let voiced = levels.iter().filter(|l| **l >= s.threshold_db).count();
+    assert!(voiced.abs_diff(voiced_before) <= 1, "no se pierde voz: {voiced_before} → {voiced} cuadros");
+}
+
+#[test]
 fn exports_reframed_formats() {
     let Some(red) = color_clip("red", "0xE02020") else { return };
     if snipsy_render::headless_device().is_none() {

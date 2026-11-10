@@ -44,6 +44,15 @@ impl SubtitlesUi {
         }
     }
 
+    /// Empieza a transcribir con las últimas opciones elegidas (sin abrir el diálogo).
+    pub fn start_now(&mut self, tl: &Timeline) -> bool {
+        if self.running.is_some() {
+            return false;
+        }
+        self.start(tl);
+        true
+    }
+
     pub fn is_busy(&self) -> bool {
         self.running.is_some()
     }

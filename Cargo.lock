@@ -3858,6 +3858,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "env_logger",
+ "image",
  "log",
  "rfd",
  "snipsy-audio",

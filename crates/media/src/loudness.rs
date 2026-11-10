@@ -9,6 +9,11 @@ use crate::{segments, Mixer};
 /// Frecuencia de análisis: de sobra para medir nivel.
 const RATE: u32 = 8_000;
 
+/// Como [`levels_without`], con la pista a excluir opcional.
+pub fn levels(tl: &Timeline, exclude: Option<TrackRef>) -> Vec<f32> {
+    levels_without(tl, exclude.unwrap_or(TrackRef::audio(usize::MAX)))
+}
+
 /// Nivel RMS (dBFS) de cada cuadro del timeline, mezclando todas las pistas de audio
 /// activas excepto `exclude` (la pista de música). Incluye volúmenes, fundidos y velocidad.
 pub fn levels_without(tl: &Timeline, exclude: TrackRef) -> Vec<f32> {

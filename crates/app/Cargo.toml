@@ -19,3 +19,6 @@ eframe.workspace = true
 egui.workspace = true
 rfd.workspace = true
 env_logger.workspace = true
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

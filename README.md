@@ -14,6 +14,7 @@ rustup update stable   # egui 0.37 requiere Rust ≥ 1.95
 ```sh
 cargo run --release                    # abre la app
 cargo run --release -- /ruta/video.mp4 # abre un video directamente
+./scripts/make_app.sh --install        # arma Snipsy.app (ícono de Snipi) y la copia a /Applications
 cargo test                             # pruebas (genera clips con ffmpeg)
 cargo test --release -p snipsy-export -- --ignored --nocapture  # medir velocidad de exportación
 cargo test --release -p snipsy-subtitles -- --ignored --nocapture  # transcripción real (descarga el modelo base)
@@ -100,6 +101,22 @@ zoom relativo), y textos y logo conservan su tamaño respecto al lado corto y su
 distancia al borde más cercano (⌘Z vuelve atrás). En **📤 Exportar** se pueden marcar
 varios formatos: se exportan uno tras otro como `Nombre_9x16.mp4`, `Nombre_1x1.mp4`…
 
+Snipi (✂, pestaña del panel izquierdo o ⌘K): la mascota de Snipsy. Entiende órdenes en
+español y las ejecuta al momento, sin IA ni internet: «corta los silencios y pásalo a
+vertical», «quita del 0:10 al 0:15», «título "OFERTA 2x1" al inicio», «blanco y negro»,
+«velocidad 2x», «subtitula», «aplica mi marca», «exporta en 9:16 y 1:1», «deshaz»… Tolera
+faltas de ortografía y acentos. Todo lo de un pedido se deshace con un solo ⌘Z, y exportar
+siempre abre el diálogo para confirmar. «ayuda» muestra lo que sabe. Lo que no entiende lo
+mandará a la IA (Claude Haiku) en la siguiente etapa. Las órdenes son acciones en JSON
+(`core::actions`) y el intérprete está en `core::intent`.
+
+Cortar silencios (✂, en el inspector sin nada seleccionado): quita las pausas de un
+video hablado y cierra los huecos en todas las pistas (video, voz, textos, subtítulos),
+conservando los vínculos video/audio. Ajustes: sensibilidad, pausa mínima y aire que se
+deja antes y después de cada frase. La pista de música (se adivina por el nombre o por el
+ducking) y el logo de marca no se cortan: siguen de corrido y se acortan al final. Solo
+se corta donde hay audio (un plano mudo a propósito no se toca). ⌘Z lo deshace.
+
 Seguimiento de rostros (🎯): cuando un video queda recortado (p. ej. 16:9 en 9:16), el
 recorte sigue a la persona en vez de quedarse al centro. Se activa o desactiva por clip
 (inspector, «Seguir rostro») y de forma general para el reencuadre (en el selector de
@@ -147,3 +164,6 @@ crates/
 12. ✅ Reencuadre automático y exportación en varios formatos a la vez
 13. ✅ Biblioteca personal (música, efectos, videos, imágenes, ediciones y exportados)
 14. ✅ Seguimiento de rostros al reencuadrar (activable por clip y en general)
+15. ✅ Cortar silencios automáticamente
+16. ✅ Snipi: asistente con atajos en español (sin IA)
+17. ⏳ Snipi con IA (Claude Haiku) para pedidos complejos

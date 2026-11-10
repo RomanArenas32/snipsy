@@ -11,7 +11,9 @@ use snipsy_core::{project, Asset, AssetId, ClipId, Frame, History, TextStyle, Ti
 use snipsy_export::{ExportEvent, ExportJob, ExportSettings, Quality, VideoCodec};
 use snipsy_media::MediaInfo;
 
+use crate::assistant_ui::{self, AssistantUi};
 use crate::brand_ui::{BrandAction, BrandUi};
+use crate::mascot::Mood;
 use crate::faces_ui::Faces;
 use crate::inspector;
 use crate::library_ui::{LibraryAction, LibraryUi};
@@ -83,6 +85,14 @@ struct RunningExport {
     secs: f64,
 }
 
+/// Pestañas del panel izquierdo.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeftTab {
+    Project,
+    Library,
+    Assistant,
+}
+
 pub struct SnipsyApp {
     timeline: Timeline,
     history: History,
@@ -100,8 +110,8 @@ pub struct SnipsyApp {
     brand: BrandUi,
     proxies: Proxies,
     library: LibraryUi,
-    /// Panel izquierdo: `true` = Biblioteca, `false` = medios del proyecto.
-    show_library: bool,
+    left_tab: LeftTab,
+    assistant: AssistantUi,
     faces: Faces,
     /// Al reencuadrar (cambiar de formato o exportar otros), seguir rostros.
     follow_faces: bool,
@@ -139,7 +149,9 @@ impl SnipsyApp {
             brand: BrandUi::new(),
             proxies,
             library: LibraryUi::new(&cc.egui_ctx),
-            show_library: false,
+            // SNIPSY_TAB=snipi abre directamente el chat (útil para pruebas y capturas).
+            left_tab: if std::env::var("SNIPSY_TAB").is_ok_and(|t| t == "snipi") { LeftTab::Assistant } else { LeftTab::Project },
+            assistant: AssistantUi::new(),
             faces,
             follow_faces: true,
             face_extra: Vec::new(),
@@ -539,6 +551,10 @@ impl SnipsyApp {
         } else if consume(Modifiers::COMMAND, Key::S) {
             self.save_project(false);
         }
+        if consume(Modifiers::COMMAND, Key::K) {
+            self.left_tab = LeftTab::Assistant;
+            self.assistant.focus();
+        }
         if consume(Modifiers::COMMAND, Key::O) {
             self.open_project_dialog();
         }
@@ -738,9 +754,19 @@ impl eframe::App for SnipsyApp {
                     self.view.selection.clear();
                     self.commit();
                     self.status = format!("✅ {n} subtítulos creados. Edita cualquiera en el inspector; «Aplicar estilo a todos» copia su formato.");
+                    if std::mem::take(&mut self.assistant.waiting_subtitles) {
+                        self.assistant.say(format!("¡Subtítulos listos! Puse {n}. Si quieres cambiar el estilo, selecciona uno y edítalo en el inspector."));
+                        self.assistant.feel(&ctx, Mood::Happy, 2.5);
+                    }
                 }
             }
-            Some(SubtitleResult::Message(m)) => self.status = m,
+            Some(SubtitleResult::Message(m)) => {
+                if std::mem::take(&mut self.assistant.waiting_subtitles) {
+                    self.assistant.say(m.clone());
+                    self.assistant.feel(&ctx, Mood::Confused, 3.0);
+                }
+                self.status = m;
+            }
             None => {}
         }
 
@@ -770,20 +796,33 @@ impl eframe::App for SnipsyApp {
         egui::Panel::left("media_pool").resizable(true).default_size(270.0).show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.show_library, false, RichText::new("Proyecto").strong());
-                ui.selectable_value(&mut self.show_library, true, RichText::new("📚 Biblioteca").strong())
+                ui.selectable_value(&mut self.left_tab, LeftTab::Project, RichText::new("Proyecto").strong());
+                ui.selectable_value(&mut self.left_tab, LeftTab::Library, RichText::new("📚 Biblioteca").strong())
                     .on_hover_text("Tu música, efectos, logos, videos y ediciones, en todos los proyectos");
+                let r = ui
+                    .selectable_value(&mut self.left_tab, LeftTab::Assistant, RichText::new(format!("✂ {}", assistant_ui::NAME)).strong())
+                    .on_hover_text("Pídele ediciones por escrito (⌘K)");
+                if r.clicked() {
+                    self.assistant.focus();
+                }
             });
             ui.separator();
-            if self.show_library {
-                if let Some(action) = self.library.show(ui, &self.timeline) {
-                    self.library_action(action);
+            match self.left_tab {
+                LeftTab::Library => {
+                    if let Some(action) = self.library.show(ui, &self.timeline) {
+                        self.library_action(action);
+                    }
+                    if let Some(m) = self.library.message.take() {
+                        self.status = m;
+                    }
                 }
-                if let Some(m) = self.library.message.take() {
-                    self.status = m;
+                LeftTab::Project => self.media_pool(ui),
+                LeftTab::Assistant => {
+                    let busy = self.subtitles.is_busy() || self.export.is_some();
+                    if let Some(text) = self.assistant.show(ui, busy) {
+                        self.run_assistant(&text, ui.ctx());
+                    }
                 }
-            } else {
-                self.media_pool(ui);
             }
         });
 
@@ -1061,6 +1100,175 @@ impl SnipsyApp {
     }
 
     /// Agrega un clip de texto de 3 s en el cabezal, en una pista por encima del video.
+    // ------------------------------------------------------------ asistente
+
+    /// Interpreta lo que escribió el usuario y lo ejecuta. Todas las ediciones de un
+    /// mismo pedido quedan en un solo paso de ⌘Z.
+    fn run_assistant(&mut self, text: &str, ctx: &egui::Context) {
+        use snipsy_core::intent;
+        let pctx = intent::ParseContext {
+            has_selection: !self.view.selection.is_empty(),
+            duration: self.timeline.frame_to_secs(self.timeline.duration()),
+            follow_faces: self.follow_faces,
+        };
+        let actions = match intent::parse(text, &pctx) {
+            Ok(a) => a,
+            Err(fragment) => {
+                self.assistant.say(format!(
+                    "Todavía no sé hacer «{fragment}» 🤔 Pronto podré con pedidos así, cuando me conecten a la IA. Escribe «ayuda» para ver lo que ya sé."
+                ));
+                self.assistant.feel(ctx, Mood::Confused, 3.0);
+                return;
+            }
+        };
+        self.player.pause();
+        let before = self.timeline.clone();
+        let mut edited = false;
+        let mut replies = Vec::new();
+        let mut failed = false;
+        for action in actions {
+            match self.run_action(action, &mut edited) {
+                Ok(reply) => replies.push(reply),
+                Err(e) => {
+                    replies.push(format!("⚠️ {e}"));
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if edited {
+            self.history.checkpoint(&before);
+            self.commit();
+        }
+        let reply = replies.into_iter().filter(|r| !r.is_empty()).collect::<Vec<_>>().join("\n");
+        if !reply.is_empty() {
+            self.status = reply.lines().last().unwrap_or_default().to_owned();
+            self.assistant.say(reply);
+        }
+        let mood = if failed { Mood::Confused } else { Mood::Happy };
+        self.assistant.feel(ctx, mood, 2.5);
+    }
+
+    /// Ejecuta una acción. `edited` se pone en `true` si cambió el timeline.
+    fn run_action(&mut self, action: snipsy_core::actions::Action, edited: &mut bool) -> Result<String, String> {
+        use snipsy_core::actions::{Action, Command, Context};
+        let need_media = |tl: &Timeline| if tl.duration() == 0 { Err("El proyecto está vacío: importa un video primero.".to_owned()) } else { Ok(()) };
+        match action {
+            Action::Edit(cmd) => {
+                let ctx = Context { selection: self.view.selection.iter().copied().collect(), playhead: self.playhead() };
+                let is_text = matches!(cmd, Command::AddText { .. });
+                let out = cmd.apply(&mut self.timeline, &ctx)?;
+                *edited = true;
+                if !out.select.is_empty() {
+                    self.view.selection = out.select.iter().copied().collect();
+                }
+                // Los títulos nuevos llevan la tipografía y colores de la marca activa.
+                if let (true, Some(kit)) = (is_text, self.brand.active()) {
+                    for id in &out.select {
+                        if let Some(style) = self.timeline.clip_mut(*id).and_then(|c| c.text.as_mut()) {
+                            kit.restyle(style);
+                        }
+                    }
+                }
+                Ok(out.message)
+            }
+            Action::CutSilences => {
+                need_media(&self.timeline)?;
+                let music = snipsy_core::silence::guess_music_track(&self.timeline);
+                let msg = inspector::cut_silences(&mut self.timeline, &Default::default(), music);
+                *edited = true;
+                Ok(msg)
+            }
+            Action::Subtitles => {
+                need_media(&self.timeline)?;
+                if !self.subtitles.start_now(&self.timeline) {
+                    return Err("Ya estoy transcribiendo; espera a que termine.".into());
+                }
+                self.assistant.waiting_subtitles = true;
+                Ok("Transcribiendo la voz… te aviso cuando estén los subtítulos (la primera vez descargo el modelo de voz).".into())
+            }
+            Action::PlaceLogo | Action::ApplyBrand => {
+                let kit = self.brand.active().cloned().ok_or("Primero crea tu marca en 🎨 Marca (logo, colores y tipografía).")?;
+                let mut parts = Vec::new();
+                if action == Action::ApplyBrand {
+                    let n = kit.restyle_all(&mut self.timeline);
+                    *edited |= n > 0;
+                    parts.push(format!("Marca «{}» aplicada a {n} texto(s)", kit.name));
+                }
+                match kit.logo.clone() {
+                    Some(path) => {
+                        need_media(&self.timeline)?;
+                        let asset = self.add_image(path)?;
+                        kit.place_logo(&mut self.timeline, asset).ok_or("No pude colocar el logo.")?;
+                        *edited = true;
+                        parts.push("logo colocado".into());
+                    }
+                    None if action == Action::PlaceLogo => return Err(format!("La marca «{}» no tiene logo: agrégalo en 🎨 Marca.", kit.name)),
+                    None => {}
+                }
+                Ok(format!("{}.", parts.join(" y ")))
+            }
+            Action::Ducking => {
+                use snipsy_core::{ducking, DuckSettings, TrackRef};
+                need_media(&self.timeline)?;
+                let music = snipsy_core::silence::guess_music_track(&self.timeline)
+                    .ok_or("No encuentro la música: ponla en su propia pista de audio (A2) y llámala «Música».")?;
+                let track = TrackRef::audio(music);
+                let s = DuckSettings::default();
+                let levels = snipsy_media::loudness::levels_without(&self.timeline, track);
+                let regions = ducking::voice_regions(&levels, self.timeline.fps, &s);
+                if regions.is_empty() {
+                    return Err("No detecté voz en las otras pistas.".into());
+                }
+                ducking::apply_ducking(&mut self.timeline, track, &regions, &s);
+                *edited = true;
+                Ok(format!("La música baja {} dB mientras hablas ({} tramo(s)).", s.amount_db, regions.len()))
+            }
+            Action::Export { formats } => {
+                need_media(&self.timeline)?;
+                if self.export.is_some() {
+                    return Err("Ya hay una exportación en curso.".into());
+                }
+                self.open_export_dialog();
+                let current = (self.timeline.width, self.timeline.height);
+                if let Some(d) = self.export_dialog.as_mut() {
+                    if !formats.is_empty() {
+                        for f in &mut d.formats {
+                            f.3 = formats.contains(&(f.1, f.2)) || (f.1, f.2) == current && formats.contains(&current);
+                        }
+                        if !d.formats.iter().any(|f| f.3) {
+                            d.formats[0].3 = true;
+                        }
+                    }
+                }
+                Ok("Te abrí la exportación con los formatos marcados: revisa y pulsa «Exportar».".into())
+            }
+            Action::Undo => {
+                if !self.history.can_undo() {
+                    return Err("No hay nada que deshacer.".into());
+                }
+                self.undo();
+                Ok("Deshecho.".into())
+            }
+            Action::Redo => {
+                if !self.history.can_redo() {
+                    return Err("No hay nada que rehacer.".into());
+                }
+                self.redo();
+                Ok("Rehecho.".into())
+            }
+            Action::Play => {
+                self.player.play();
+                Ok(String::new())
+            }
+            Action::Pause => {
+                self.player.pause();
+                Ok(String::new())
+            }
+            Action::Help => Ok(snipsy_core::intent::HELP.to_owned()),
+        }
+    }
+
     fn add_text(&mut self) {
         let at = self.playhead();
         let len = (self.timeline.fps * 3.0).round() as Frame;
